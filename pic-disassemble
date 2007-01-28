@@ -1,0 +1,444 @@
+#!/usr/bin/perl
+
+##########################################################################
+#
+# PIC 16C84 (and related) disassembler
+#
+#     (c) 2004 Jorj Bauer, <jorj@seas.upenn.edu>
+#
+# Placed in the public domain. Free for any (including commercial) use.
+#
+# Please be courteous and give me credit where credit may be due.
+#
+##########################################################################
+
+use Getopt::Std;
+
+my $version = '1.0';
+
+# List of microcontroller instructions. The arrays are information about 
+# how to disassemble the instruction:
+#   [0] is the command (sans arguments);
+#   [1] is the mask (to derrive the command or the arguments),
+#   [2] is the type of operand. (Note that this could probably be derrived
+#       from the mask, but I've decided to include it here in order to 
+#       provide some more flexibility if a future modification to this 
+#       program makes it harder to derrive these from the mask.)
+#       The values are:
+#           0 means it's a standalone opcode,
+#           F means it has a file register,
+#           FB means it has a file, bitnumber,
+#           FD means it has a file, destination,
+#           8K means it has an 8-bit k (literal) value,
+#           11K means it has an 11-bit k (literal) value
+
+my %instructions = ( 
+		     'CLRW'   => [ 0x0100, 0xff80, 0 ],
+		     'CLRWDT' => [ 0x0064, 0xffff, 0 ],
+		     'NOP'    => [ 0x0000, 0xff9f, 0 ],
+		     'OPTION' => [ 0x0062, 0xffff, 0 ],
+		     'RETFIE' => [ 0x0009, 0xffff, 0 ],
+		     'RETURN' => [ 0x0008, 0xffff, 0 ],
+		     'SLEEP'  => [ 0x0063, 0xffff, 0 ],
+
+		     'CLRF'   => [ 0x0180, 0xff80, 'F' ],
+		     'MOVWF'  => [ 0x0080, 0xff80, 'F' ],
+
+		     'BCF'    => [ 0x1000, 0xfc00, 'FB' ],
+		     'BTFSC'  => [ 0x1800, 0xfc00, 'FB' ],
+		     'BTFSS'  => [ 0x1c00, 0xfc00, 'FB' ],
+		     'BSF'    => [ 0x1400, 0xfc00, 'FB' ],
+
+		     'ADDWF'  => [ 0x0700, 0xff00, 'FD' ],
+		     'ANDWF'  => [ 0x0500, 0xff00, 'FD' ],
+		     'COMF'   => [ 0x0900, 0xff00, 'FD' ],
+		     'DECF'   => [ 0x0300, 0xff00, 'FD' ],
+		     'DECFSZ' => [ 0x0b00, 0xff00, 'FD' ],
+		     'INCF'   => [ 0x0a00, 0xff00, 'FD' ],
+		     'INCFSZ' => [ 0x0f00, 0xff00, 'FD' ],
+		     'IORWF'  => [ 0x0400, 0xff00, 'FD' ],
+		     'MOVF'   => [ 0x0800, 0xff00, 'FD' ],
+		     'RLF'    => [ 0x0d00, 0xff00, 'FD' ],
+		     'RRF'    => [ 0x0c00, 0xff00, 'FD' ],
+		     'SUBWF'  => [ 0x0200, 0xff00, 'FD' ],
+		     'SWAPF'  => [ 0x0e00, 0xff00, 'FD' ],
+		     'XORWF'  => [ 0x0600, 0xff00, 'FD' ],
+
+		     'ADDLW'  => [ 0x3e00, 0xfe00, '8K' ],
+		     'ANDLW'  => [ 0x3900, 0xff00, '8K' ],
+		     'IORLW'  => [ 0x3800, 0xff00, '8K' ],
+		     'MOVLW'  => [ 0x3000, 0xfc00, '8K' ],
+		     'RETLW'  => [ 0x3400, 0xfc00, '8K' ],
+		     'SUBLW'  => [ 0x3c00, 0xfe00, '8K' ],
+		     'XORLW'  => [ 0x3a00, 0xff00, '8K' ],
+
+		     'CALL'   => [ 0x2000, 0xf800, '11K' ],
+		     'GOTO'   => [ 0x2800, 0xf800, '11K' ],
+		     );
+
+# Names of the basic file registers on the 16C84.
+# Theoretically, user-defined file register variables could be named and 
+# mapped into this space. Sounds like a future enhancement...
+
+my %registers = ( 0x00 => 'IADDR',
+		  0x01 => 'TMR0',
+		  0x02 => 'PCL',
+		  0x03 => 'STATUS',
+		  0x04 => 'FSR',
+		  0x05 => 'PORTA',
+		  0x06 => 'PORTB',
+		  0x08 => 'EEDATA',
+		  0x09 => 'EEADR',
+		  0x0A => 'PCLATH',
+		  0x0B => 'INTCON',
+
+		  0x80 => 'IADDR',
+		  0x81 => 'OPTION',
+		  0x82 => 'PCL',
+		  0x83 => 'STATUS',
+		  0x84 => 'FSR',
+		  0x85 => 'TRISA',
+		  0x86 => 'TRISB',
+		  0x88 => 'EECON1',
+		  0x89 => 'EECON2',
+		  0x8A => 'PCLATH',
+		  0x8B => 'INTCON',
+		  );
+
+# Names of the bits of the common registers.
+my %bits = ( 'STATUS' => [ 'C', 'DC', 'Z', '/PD', '/TO', 'RP0', 'RP1', 'IRP' ],
+	     'PORTA'  => [ 'RA0', 'RA1', 'RA2', 'RA3', 'RA4/T0CKI', 5, 6, 7 ],
+	     'PORTB'  => [ 'RB0', 'RB1', 'RB2', 'RB3', 'RB4', 'RB5', 'RB6',
+			   'RB7' ],
+	     'INTCON' => [ 'RBIF', 'INTF', 'T0IF', 'RBIE', 'INTE', 'T0IE',
+			   'EEIE', 'GIE' ],
+	     'OPTION' => [ 'PS0', 'PS1', 'PS2', 'PSA', 'T0SE', 'T0CS', 
+			   'INTEDG', '/RBPU' ],
+	     'EECON1' => [ 'RD', 'WR', 'WREN', 'WRERR', 'EEIF', 5, 6, 7 ],
+	     );
+	     
+# Labels for well-known addresses. Again, the users' subroutine labels could
+# be mapped into this array.
+my %labels = ( 0x0000 => 'RESETVEC',
+	       0x0004 => 'INTRVEC',
+	       0x2007 => 'CONFIG',
+	       0x2100 => 'EEPROM',
+	       );
+
+# Memory locations that shouldn't be disassembled, but just printed as 'dw ...'
+# 0x2007 is the configuration bits, and 0x2100+ are the EEPROM data.
+my @DWs = ( 0x2007, 0x2100..0x2200 );
+
+# @memory contains the entire program.
+my @memory;
+
+# %mask is a mapping of whether or not we want to disassemble any particular
+# range of bytecode. It's populated as the file is read in.
+my %mask;
+
+# $codesize is the index of the highest word of code we've read in. This could
+# be gotten to by looking at the size of @memory, but at some point maybe I'll
+# come up with a more efficient way to deal with the program... and then it 
+# will be important to know what the size of the code is.
+my $codesize = 0;
+
+getopts('b:i:r:al');
+
+&usage if (! ($opt_b || $opt_i));
+
+&make_opcodes_lowercase if ($opt_l);
+
+if ($opt_b) {
+    $codesize = &read_binary($opt_b);
+} elsif ($opt_i) {
+    $codesize = &read_intelhex($opt_i);
+} else {
+    &usage;
+}
+
+if ($opt_r) {
+    &load_register_file($opt_r);
+}
+
+# First pass: parse each instruction and determine if it refers to another 
+# chunk of memory. If it does, we'll create a label for that chunk of memory.
+my $address = 0;
+do {
+    my $word = $memory[$address];
+
+    my $opcode = &find_opcode($word);
+
+    if (uc($opcode) eq 'CALL' || uc($opcode) eq 'GOTO') {
+	# Find the referenced address and label it if it's not already labelled
+
+	my $target = $word & 0x7FF;
+
+	my $label = &make_label($target);
+	$labels{$target} = $label unless ($labels{$target});
+    }
+
+    $address++;
+} while ($address < $codesize);
+
+# Second pass: go back through and print the disassembly.
+$address = 0;
+my $insegment = 0; # if 0, we need to print an 'ORG'
+do {
+    if ($mask{$address}) {
+	if (!$insegment) {
+	    print sprintf("\n%s%-8.8s %-8.8s 0x%.4X\n\n",
+			  &format_address($address), 
+			  "", 
+			  $opt_l?"org":"ORG",
+			  $address);
+	    $insegment = 1;
+	}
+
+	my $word = $memory[$address];
+	
+	print &disassemble_instruction($address, $word), "\n";
+
+	# Make the output pretty. If it was a RETFIE / RETURN / GOTO et al and
+	# the next instruction has a label, we'll print an extra newline.
+	my $opcode = uc(&find_opcode($word));
+
+	if ( ($opcode eq 'GOTO' || $opcode eq 'RETURN' || 
+	      $opcode eq 'RETFIE' || $opcode eq 'RETLW')
+	     &&
+	     defined $labels{$address+1} ) {
+	    print "\n";
+	}
+
+    } else {
+	$insegment = 0;
+    }
+
+    $address++;
+} while ($address < $codesize);
+
+exit (0);
+
+sub find_opcode {
+    my ($word) = @_;
+
+    foreach my $opcode (keys(%instructions)) {
+	my $info = $instructions{$opcode};
+	if (($word & $info->[1]) == $info->[0]) {
+	    return $opcode;
+	}
+    }
+
+    return "???";
+}
+
+sub get_type {
+    my ($opcode) = @_;
+
+    return $instructions{$opcode}->[2];
+}
+
+sub disassemble_instruction {
+    my ($address, $word) = @_;
+
+    return sprintf("%s%-8.8s %-8.8s 0x%X",
+		   &format_address($address),
+		   $labels{$address},
+		   $opt_l?'dw':'DW',
+		   $word)
+	if (&is_dwaddr);
+
+    my $opcode = &find_opcode($word);
+    my $type = &get_type($opcode);
+    my $base = sprintf("%s%-8.8s %-8.8s", 
+		       &format_address($address), 
+		       $labels{$address},
+		       $opcode);
+
+    if (!$type) {
+	return $base;
+    } elsif ($type eq 'F') {
+	return sprintf("%s %s", $base, &make_regname($word & 0x7F));
+    } elsif ($type eq 'FD') {
+	return sprintf("%s %s, %s", 
+		       $base, 
+		       &make_regname ($word & 0x7F),
+		       (($word & 0x80) == 0) ? "W" : "F"
+		       );
+    } elsif ($type eq 'FB') {
+	my $register = &make_regname($word & 0x7F);
+
+	return sprintf("%s %s, %s", 
+		       $base, 
+		       $register, 
+		       &make_bitname ($register, ($word >> 7) & 7) );
+    } elsif ($type eq '8K') {
+	return sprintf("%s 0x%02X", $base, $word & 0xFF);
+    } elsif ($type eq '11K') {
+	return sprintf("%s %s", $base, &make_label($word & 0x7FF));
+    }
+
+    # Shouldn't ever reach here...
+
+    return "???";
+}
+
+sub make_regname {
+    my ($register) = @_;
+
+    # If a register name is in the %registers hash, then return it. Otherwise
+    # we just return the hex version of the number.
+
+    return $registers{$register} if ($registers{$register});
+
+    return sprintf("0x%02X", $register);
+}
+
+sub make_bitname {
+    my ($regname, $bit) = @_;
+
+    # If we can find a mapping for the bit name in the %bits hash, return it.
+    # Otherwise just return the bit number.
+
+    return $bits{$regname}->[$bit] if (defined $bits{$regname}->[$bit]);
+
+    return $bit;
+}
+
+sub make_label {
+    my ($address) = @_;
+
+    # Turn an address into a unique label name. Currently, this does it 
+    # by directly using the target address.
+
+    return $labels{$address} if ($labels{$address});
+
+    return sprintf("L%.4X", $address);
+}
+
+sub is_dwaddr {
+    my ($addr) = @_;
+
+    # Return whether or not the value is in the @DWs array.
+
+    foreach my $i (@DWs) {
+	return 1 if ($addr == $i);
+    }
+
+    return 0;
+
+}
+
+sub usage {
+    print "Usage: $0 [-a] <-b <filename> | -i <filename>>\n".
+
+	"\t-a:            show a column of addresses\n".
+	"\t-b <filename>: read from binary file <filename>\n".
+	"\t-i <filename>: read from Intel Hex file <filename>\n".
+	"\t-l:            show opcodes in lowercase\n".
+	"\t-r <filename>: load register name hint file <filename>\n".
+	"\n"
+	;
+    
+    exit(-1);
+}
+
+# read_binary: read in a little-endian binary file.
+# Drawback: can't tell what areas of memory to NOT disassemble (empty
+#           regions).
+
+sub read_binary {
+    my ($filename) = @_;
+    my $byte, $codesize;
+
+# Read in the entire file and populate the memory array.
+    open (FILE, $filename) || die "Can't open '$filename': $!";
+    binmode(FILE);
+    
+    while ( read(FILE, $byte, 2) == 2) {
+	$mask{$codesize} = 1;
+	$memory[$codesize++] = unpack("v", $byte);
+    }
+    close FILE;
+
+    return $codesize;
+}
+
+# read_intelhex: read in an Intel Hexfile format, as generated by 
+# picl and presumably MPASM. This lets us also tell which areas of
+# memory are just holes, and shouldn't be disassembled.
+
+sub read_intelhex {
+    my ($filename) = @_;
+    my ($line, $codesize, $num, $addr, $type, $data);
+
+    open (FILE, $filename) || die "Can't open '$filename': $!";
+    # Specifically NOT binmode.
+
+    while ($line = <FILE>) {
+	chomp;
+	$line =~ /^:(..)(....)(..)(.*)$/;
+	$num = hex($1);
+	$addr = hex($2);
+	$type = hex($3);
+	$data = $4;
+
+	# The Intel hex format is byte-based, but the PIC microcontroller
+	# is word-based. We read in all of the data one byte at a time, and
+	# make a determination as to whether it is the low or high word of
+	# the memory word. (The Intel format is little-endian.)
+
+	if ($type == 0) {
+	    for my $i (0..$num-1) {
+		my $offset = 0; # number of bytes to shift left
+		my $byte = substr($data, $i*2, 2);
+		$byte = hex $byte;
+		if (($addr + $i) & 0x01) {
+		    $offset = 8; # if it's an odd byte, it's a high byte
+		}
+
+		$memory[ ($addr + $i) / 2 ] =
+		    $memory[ ($addr + $i) / 2 ]  | ($byte << $offset);
+
+		$mask{ int (($addr + $i) / 2) } = 1;
+		$codesize = int (($addr + $i) / 2) 
+		    if (int(($addr + $i)/2) > $codesize);
+	    }
+	}
+    }
+    close FILE;
+
+    return $codesize;
+}
+
+sub format_address {
+    my ($address) = @_;
+
+    return sprintf("0x%.4X ", $address) if ($opt_a);
+
+    return "";
+}
+
+sub make_opcodes_lowercase {
+    foreach my $i (keys(%instructions)) {
+	my $newkey = lc($i);
+	$instructions{$newkey} = $instructions{$i};
+	delete $instructions{$i};
+    }
+   
+}
+
+sub load_register_file {
+    my ($file) = @_;
+
+    # Read in a file that contains whitespace-delimited varable name / 
+    # address information.
+
+    open(FILE, $file) || die "Can't open register file '$file': $!";
+    while (<FILE>) {
+	chomp;
+	my ($var, $addr)  = split(/\s+/);
+	$addr = hex($addr) if ($addr =~ /^0x/i);
+	$registers{$addr} = $var;
+    }
+    close FILE;
+}
