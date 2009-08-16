@@ -17,16 +17,16 @@ use warnings;
 use Getopt::Std;
 use GraphViz;
 
-our ($opt_a, $opt_b, $opt_i, $opt_r, $opt_g, $opt_m, $opt_l, $opt_s);
+our ($opt_a, $opt_b, $opt_i, $opt_r, $opt_g, $opt_m, $opt_l, $opt_s, $opt_S);
 
 # Default options for all graph nodes.
-my %graphopts = ( fontname => 'luxisri',
-		  labelfontname => 'luxisri',
+my %graphopts = ( fontname => 'Times-Roman',
+		  labelfontname => 'Times-Roman',
 		  fontsize => 12,
 		  labelfontsize => 10,
 		  );
 
-my $version = '1.06';
+my $version = '1.07';
 
 # List of microcontroller instructions. The arrays are information about 
 # how to disassemble the instruction:
@@ -233,7 +233,7 @@ my $RP = 0;
 # We also try to keep track of the state of PCLATH<4:3>, code-page state.
 my $CP = 0;
 
-getopts('b:i:m:r:alg:s');
+getopts('b:i:m:r:alg:sS:');
 
 usage() if (! ($opt_b || $opt_i));
 
@@ -649,6 +649,7 @@ sub usage {
 	"\t-m <filename>: load register hints from mapfile <filename>\n".
 	"\t-r <filename>: load register name hint file <filename>\n".
 	"\t-s:            simplify labels as much as possible\n".
+	"\t-S <regexes>:  ignore labels in mapfile that match given (colon-separated) regexes\n".
 	"\n"
 	;
     
@@ -778,6 +779,7 @@ sub load_map_file {
     open(OUT, ">", $tmpfile) || die "Can't open temp file '$tmpfile': $!";
 
     open(FILE, $file) || die "Can't open map file '$file': $!";
+readloop:
     while (<FILE>) {
 	chomp;
 	my ($var, $addr, $loc, $other) = /^(.{25})(.{11})(.{11})(.+)$/;
@@ -789,6 +791,13 @@ sub load_map_file {
 	$var =~ s/ //g;
 	$addr =~ s/ //g;
 	$loc =~ s/ //g;
+	if ($opt_S) {
+	    foreach my $i (split(/:/, $opt_S)) {
+		next readloop
+		    if ($var =~ /$i/);
+	    }
+	}
+
 	if ($addr =~ /0x/) {
 	    if ($loc eq 'program') {
 		print OUT "$var\tL$addr\n"; # note the L
