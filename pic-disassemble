@@ -4,7 +4,7 @@
 #
 # PIC 16C84, 16F84, 16F627, 16F628 (and related) disassembler
 #
-#     (c) 2004-2007 Jorj Bauer, <jorj@seas.upenn.edu>
+#     (c) 2004-2009 Jorj Bauer, <jorj@seas.upenn.edu>
 #
 # Placed in the public domain. Free for any (including commercial) use.
 #
@@ -13,6 +13,7 @@
 ##########################################################################
 
 use strict;
+use warnings;
 use Getopt::Std;
 use GraphViz;
 
@@ -25,7 +26,7 @@ my %graphopts = ( fontname => 'luxisri',
 		  labelfontsize => 10,
 		  );
 
-my $version = '1.05';
+my $version = '1.06';
 
 # List of microcontroller instructions. The arrays are information about 
 # how to disassemble the instruction:
@@ -91,6 +92,9 @@ my %instructions = (
 # Theoretically, user-defined file register variables could be named and 
 # mapped into this space. Sounds like a future enhancement...
 
+# These registers come from the PIC16f877A documentation. I think they'll be 
+# correct for other PICs (i.e. a superset), but...
+
 my %registers = ( 0x00 => 'INDF',
 		  0x01 => 'TMR0',
 		  0x02 => 'PCL',
@@ -102,6 +106,26 @@ my %registers = ( 0x00 => 'INDF',
 		  0x09 => 'EEADR',
 		  0x0A => 'PCLATH',
 		  0x0B => 'INTCON',
+		  0x0C => 'PIR1',
+		  0x0D => 'PIR2',
+		  0x0E => 'TMR1L',
+		  0x0F => 'TMR1H',
+		  0x10 => 'T1CON',
+		  0x11 => 'TMR2',
+		  0x12 => 'T2CON',
+		  0x13 => 'SSPBUF',
+		  0x14 => 'SSPCON',
+		  0x15 => 'CCPR1L',
+		  0x16 => 'CCPR1H',
+		  0x17 => 'CCP1CON',
+		  0x18 => 'RCSTA',
+		  0x19 => 'TXREG',
+		  0x1A => 'RCREG',
+		  0x1B => 'CCPR2L',
+		  0x1C => 'CCPR2H',
+		  0x1D => 'CCP2CON',
+		  0x1E => 'ADRESH',
+		  0x1F => 'ADCON0',
 
 		  0x80 => 'INDF',
 		  0x81 => 'OPTION',
@@ -114,6 +138,51 @@ my %registers = ( 0x00 => 'INDF',
 		  0x89 => 'EECON2',
 		  0x8A => 'PCLATH',
 		  0x8B => 'INTCON',
+		  0x8C => 'PIE1',
+		  0x8D => 'PIE2',
+		  0x8E => 'PCON',
+		  
+		  0x91 => 'SSPCON2',
+		  0x92 => 'PR2',
+		  0x93 => 'SSPADD',
+		  0x94 => 'SSPSTAT',
+
+		  0x98 => 'TXSTA',
+		  0x99 => 'SPBRG',
+		  
+		  0x9C => 'CMCON',
+		  0x9D => 'CVRCON',
+		  0x9E => 'ADRESL',
+		  0x9F => 'ADCON1',
+
+		  0x100 => 'INDF',
+		  0x101 => 'TMR0',
+		  0x102 => 'PCL',
+		  0x103 => 'STATUS',
+		  0x104 => 'FSR',
+
+		  0x106 => 'PORTB',
+
+		  0x10A => 'PCLATH',
+		  0x10B => 'INTCON',
+		  0x10C => 'EEDATA',
+		  0x10D => 'EEADR',
+		  0x10E => 'EEDATH',
+		  0x10F => 'EEADRH',
+
+		  0x180 => 'INDF',
+		  0x181 => 'OPTION',
+		  0x182 => 'PCL',
+		  0x183 => 'STATUS',
+		  0x184 => 'FSR',
+
+		  0x186 => 'TRISB',
+
+		  0x18A => 'PCLATH',
+		  0x18B => 'INTCON',
+		  0x18C => 'EECON1',
+		  0x18D => 'EECON2',
+		  
 		  );
 
 # Names of the bits of the common registers.
@@ -156,10 +225,13 @@ my %mask;
 # will be important to know what the size of the code is.
 my $codesize = 0;
 
-# We try to keep track of the state of the RP0 bit (page state), so that we
+# We try to keep track of the state of the RP0 bit (bank state), so that we
 # can show the file register being dealt with more accurately. This isn't
 # going to be perfect, but it'll be a start.
-my $RP0 = 0;
+my $RP = 0;
+
+# We also try to keep track of the state of PCLATH<4:3>, code-page state.
+my $CP = 0;
 
 getopts('b:i:m:r:alg:s');
 
@@ -190,18 +262,27 @@ if ($opt_g) {
 
 # First pass: parse each instruction and determine if it refers to another 
 # chunk of memory. If it does, we'll create a label for that chunk of memory.
+# Note that we have to keep track of $RP and $CP to do this properly.
 my $address = 0;
 my $last_label;
 do {
-    my $word = $memory[$address];
+    my $word = $memory[$address] || 0;
 
     my $opcode = find_opcode($word);
 
+    # Setup these three variables to track $CP and $RP
+    my $register = ($word & 0x7f) + ($RP << 7);
+    my $bitnum = ($word >> 7) & 7;
+    my $registername = make_regname($register);
+
+    # For bit clear and set, we'll watch for flips of RP[01] and PCLATH[3:4].
+    check_pages($opcode, $registername, $bitnum)
+	if ($opcode =~ /^b[sc]f/i);
+    
     if (uc($opcode) eq 'CALL' || uc($opcode) eq 'GOTO') {
 	# Find the referenced address and label it if it's not already labelled
 
-	my $target = $word & 0x7FF;
-
+        my $target = ($word & 0x7FF) + ($CP << 11);
 	my $label = make_label($target);
 
 	if ($label !~ /^L[0-9A-Fx]+/) {
@@ -295,6 +376,8 @@ if ($opt_g) {
 }
 
 # Second pass: go back through and print the disassembly.
+$RP = 0;
+$CP = 0;
 $address = 0;
 my $insegment = 0; # if 0, we need to print an 'ORG'
 do {
@@ -308,21 +391,35 @@ do {
 	    $insegment = 1;
 	}
 
-	my $word = $memory[$address];
+	my $word = $memory[$address] || 0;
 	
 	my $disassembly = disassemble_instruction($address, $word);
+        my $opcode = find_opcode($word);
 
-        if ($RP0 == 1) {
-           $disassembly = sprintf("%-40.40s %s",
+        my $comment = '';
+        if ($RP != 0) {
+           $comment = '; NOTE: register bank ' . $RP;
+        }
+        if ($CP != 0) {
+           if ($opcode =~ /^call$/i || $opcode =~ /^goto$/i) {
+               if (!$comment) {
+                   $comment = '; NOTE: code page ' . $CP;
+               } else {
+                   $comment .= ' and CP ' . $CP;
+               }
+           }
+        }
+        if ($comment) {
+           $disassembly = sprintf("%-55.55s %s",
                                   $disassembly,
-                                  "; NOTE: Working in Page 1");
+                                  $comment);
         }
 
         print $disassembly, "\n";
 
 	# Make the output pretty. If it was a RETFIE / RETURN / GOTO et al and
 	# the next instruction has a label, we'll print an extra newline.
-	my $opcode = uc(find_opcode($word));
+	$opcode = uc(find_opcode($word));
 
 	if ( ($opcode eq 'GOTO' || $opcode eq 'RETURN' || 
 	      $opcode eq 'RETFIE' || $opcode eq 'RETLW')
@@ -377,12 +474,12 @@ sub unconditional_branch_before {
     my ($address) = @_;
 
     # Is the previous instruction a return/goto/retfie/retlw?
-    my $word = $memory[$address-1];
+    my $word = $memory[$address-1] || 0;
     my $opcode = uc(find_opcode($word));
     if ( ($opcode eq 'GOTO' || $opcode eq 'RETURN' || 
 	  $opcode eq 'RETFIE' || $opcode eq 'RETLW') ) {
 	# Check out the opcode before that and see if it's a skip
-	$word = $memory[$address-2];
+	$word = $memory[$address-2] || 0;
 	$opcode = uc(find_opcode($word));
 
 	return 1
@@ -406,7 +503,7 @@ sub unconditional_branch_before {
 # (used to compute flow diagrams.)
 sub is_goto {
     my ($address) = @_;
-    my $word = $memory[$address];
+    my $word = $memory[$address] || 0;
     my $opcode = uc(find_opcode($word));
     return ($opcode eq 'GOTO');
 }
@@ -439,12 +536,12 @@ sub disassemble_instruction {
 		   $opt_l?'dw':'DW',
 		   $word)
 	if (is_dwaddr($address));
-
+    
     my $opcode = find_opcode($word);
     my $type = get_type($opcode);
     my $base = sprintf("%s%-16.16s %-8.8s", 
 		       format_address($address), 
-		       $labels{$address},
+		       $labels{$address} || '',
 		       $opcode,
                        );
 
@@ -453,13 +550,13 @@ sub disassemble_instruction {
     } elsif ($type eq 'F') {
 	# If the RP0 flag is set for page 1, then add 0x80
 	my $register = $word & 0x7F;
-	$register += 0x80 if ($RP0 == 1);
+        $register += ($RP << 7);
 
 	return sprintf("%s %s", $base, make_regname($register));
     } elsif ($type eq 'FD') {
 	# If the RP0 flag is set for page 1, then add 0x80
 	my $register = $word & 0x7F;
-	$register += 0x80 if ($RP0 == 1);
+	$register += ($RP << 7);
 
 	return sprintf("%s %s, %s", 
 		       $base, 
@@ -469,23 +566,15 @@ sub disassemble_instruction {
     } elsif ($type eq 'FB') {
 	# If the RP0 flag is set for page 1, then add 0x80
 	my $register = $word & 0x7F;
-	$register += 0x80 if ($RP0 == 1);
+        $register += ($RP << 7);
 
 	my $bitnum = ($word >> 7) & 7;
 	my $registername = make_regname($register);
 
 	# If the opcode is BSF or BCF, and the F is STATUS,
 	# and the bitnumber is RP0, then update the current RP0 flag
-
-	if ($opcode =~ /^b[sc]f/i) {
-	    if ( make_bitname($registername, $bitnum) =~ /^rp0$/i) {
-		if ($opcode =~ /^bsf/i) {
-		    $RP0 = 1;
-		} else {
-		    $RP0 = 0;
-		}
-	    }
-	}
+        check_pages($opcode, $registername, $bitnum)
+	    if ($opcode =~ /^b[sc]f/i);
 
 	return sprintf("%s %s, %s", 
 		       $base, 
@@ -494,7 +583,8 @@ sub disassemble_instruction {
     } elsif ($type eq '8K') {
 	return sprintf("%s 0x%02X", $base, $word & 0xFF);
     } elsif ($type eq '11K') {
-	return sprintf("%s %s", $base, make_label($word & 0x7FF));
+        my $target = ($word & 0x7FF) + ($CP << 11);
+	return sprintf("%s %s", $base, make_label($target));
     }
 
     # Shouldn't ever reach here...
@@ -571,7 +661,7 @@ sub usage {
 
 sub read_binary {
     my ($filename) = @_;
-    my $byte, $codesize;
+    my ($byte, $codesize);
 
 # Read in the entire file and populate the memory array.
     open (FILE, $filename) || die "Can't open '$filename': $!";
@@ -594,11 +684,13 @@ sub read_intelhex {
     my ($filename) = @_;
     my ($line, $codesize, $num, $addr, $type, $data);
 
+    $codesize = 0;
+
     open (FILE, $filename) || die "Can't open '$filename': $!";
     # Specifically NOT binmode.
 
     while ($line = <FILE>) {
-	chomp;
+	chomp $line;
 	$line =~ /^:(..)(....)(..)(.*)$/;
 	$num = hex($1);
 	$addr = hex($2);
@@ -618,6 +710,8 @@ sub read_intelhex {
 		if (($addr + $i) & 0x01) {
 		    $offset = 8; # if it's an odd byte, it's a high byte
 		}
+
+                $memory[ ($addr + $i) / 2 ] ||= 0;
 
 		$memory[ ($addr + $i) / 2 ] =
 		    $memory[ ($addr + $i) / 2 ]  | ($byte << $offset);
@@ -687,6 +781,11 @@ sub load_map_file {
     while (<FILE>) {
 	chomp;
 	my ($var, $addr, $loc, $other) = /^(.{25})(.{11})(.{11})(.+)$/;
+	$var ||= '';
+	$addr ||= '';
+	$loc ||= '';
+	$other ||= '';
+
 	$var =~ s/ //g;
 	$addr =~ s/ //g;
 	$loc =~ s/ //g;
@@ -704,3 +803,32 @@ sub load_map_file {
     load_register_file($tmpfile);
     unlink $tmpfile;
 }
+
+sub check_pages {
+    my ($opcode, $registername, $bitnum) = @_;
+
+    if ($opcode =~ /^b[sc]f/i) {
+	my $bitname = make_bitname($registername, $bitnum);
+	if ( $bitname =~ /^rp0$/i ) {
+	    if ($opcode =~ /^bsf/i) {
+		$RP |= 1;
+	    } else {
+		$RP &= ~0x01;
+	    }
+	} elsif ( $bitname =~ /^rp1$/i ) {
+	    if ($opcode =~ /^bsf/i) {
+		$RP |= 2;
+	    } else {
+		$RP &= ~0x02;
+	    }
+	} elsif ( $registername =~ /^pclath$/i && 
+		  ($bitnum == 3 || $bitnum == 4) ) {
+	    if ($opcode =~ /^bsf/i) {
+		$CP |= (1<<($bitnum-3));
+	    } else {
+		$CP &= ~ (1<<($bitnum-3));
+	    }
+	}
+    }
+}
+
