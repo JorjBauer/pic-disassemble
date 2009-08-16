@@ -17,9 +17,10 @@ use warnings;
 use Getopt::Std;
 use GraphViz;
 use Data::Dumper;
+use Fcntl qw/:seek/;
 
 our ($opt_a, $opt_b, $opt_d, $opt_D, $opt_i, $opt_r, $opt_g, $opt_m, 
-     $opt_l, $opt_s, $opt_S);
+     $opt_l, $opt_s, $opt_S, $opt_I);
 
 our @depths;     # depth of all memory locations we've tested so far
 our @avenues;    # Avenues contain CP, pc, depth
@@ -32,7 +33,7 @@ my %graphopts = ( fontname => 'Times-Roman',
 		  labelfontsize => 10,
 		  );
 
-my $version = '1.09';
+my $version = '1.11b';
 
 # List of microcontroller instructions. The arrays are information about 
 # how to disassemble the instruction:
@@ -217,6 +218,7 @@ my %labels = ( 0x0000 => 'RESETVEC',
 # turned into something less processor-dependent. FIXME (eventually).
 my @DWs = ( 0x2007, 0x2100..0x2200 );
 my $MAX_PROGRAM_SPACE = 0x2000;
+my %section;
 
 # @memory contains the entire program.
 our @memory;
@@ -239,7 +241,7 @@ my $RP = 0;
 # We also try to keep track of the state of PCLATH<4:3>, code-page state.
 my $CP = 0;
 
-getopts('b:dD:i:m:r:alg:sS:');
+getopts('b:dD:i:m:r:alg:sS:I:');
 
 usage() if (! ($opt_b || $opt_i));
 
@@ -258,7 +260,18 @@ if ($opt_r) {
 }
 
 if ($opt_m) {
-    load_map_file($opt_m);
+    foreach my $i (split(/:/, $opt_m)) {
+	load_map_file($i);
+    }
+}
+
+if ($opt_I) {
+    foreach my $i (split(/:/, $opt_I)) {
+	# Find all of the opt_I sections and put them in the @DWs array to not
+	# disassemble them.
+	push (@DWs, @{$section{$i}})
+	    if ($section{$i});
+    }
 }
 
 my $graph;
@@ -400,7 +413,10 @@ do {
 	}
 
 	my $word = $memory[$address] || 0;
-	
+
+	my $pre_label = disassemble_label($address, $word);
+        print "$pre_label\n"
+          if ($pre_label);
 	my $disassembly = disassemble_instruction($address, $word);
         my $opcode = find_opcode($word);
 
@@ -547,6 +563,8 @@ sub examine_avenue {
     $RP = 0; # not really important for this analysis
     my $depth = $avenue->{depth};
     my @stack = clone_stack($avenue->{stack});
+    my $in_lookup_table = 0;
+    my $lookup_table_did_goto = 0;
 
     my $label = $labels{$pc};
     if (!$label) {
@@ -558,8 +576,16 @@ sub examine_avenue {
 	if ($mask{$pc}) {
 	    my $word = $memory[$pc] || 0;
 	    
+	    my $pre_label = disassemble_label($address, $word);
 	    my $disassembly = disassemble_instruction($pc, $word);
 	    my $opcode = find_opcode($word);
+
+	    # If we're currently in what looks like a lookup table, and 
+	    # we saw a 'goto' or 'retlw' before, and this opcode isn't
+	    #  a 'nop' or a 'goto' or a 'retlw', then we're done this avenue.
+	    return
+		if ( $in_lookup_table && $lookup_table_did_goto && 
+		     ($opcode !~ /goto/i && $opcode !~ /nop/i && $opcode !~ /retlw/i) );
 	    
 	    # For bit clear and set, we'll watch for flips of RP[01] and
 	    # PCLATH[3:4].   
@@ -594,20 +620,57 @@ sub examine_avenue {
 
 	    if ( $opcode =~ /call/i ) {
 		my $target = ($word & 0x7FF) + ($CP << 11);
-		add_avenue($target, $depth + 1, [@stack, $labels{$target}]);
+
+		if (! $labels{$target} ) {
+		    my $to = sprintf("%X", $target);
+		    my $from = sprintf("%X", $pc);
+		    print STDERR "possible PCLATH error: address 0x$from calls 0x$to\n";
+		}
+
+		add_avenue($target, $depth + 1, [@stack, make_label($target)]);
 	    } elsif ( $opcode =~ /goto/i ) {
 		my $target = ($word & 0x7FF) + ($CP << 11);
+
+		if (! $labels{$target} ) {
+		    my $to = sprintf("%X", $target);
+		    my $from = sprintf("%X", $pc);
+		    print STDERR "possible PCLATH error: address 0x$from goes to 0x$to\n";
+		}
+
 		add_avenue($target, $depth, \@stack);
-		return;
+		if ( $in_lookup_table ) {
+		    # If we're in a lookup table, and we hit a 'goto', then
+		    # we want to end this avenue as soon as we find a non-
+		    # goto.
+		    $lookup_table_did_goto = 1;
+		} else {
+		    # Normal case: we did a 'goto' so this avenue is done.
+		    return;
+		}
 	    }
 	    elsif ( $opcode =~ /btfs/i || $opcode =~ /incfsz/i || $opcode =~ /decfsz/i ) {
 		my $target = $pc + 2; # already takes $CP into account
 		add_avenue($target, $depth, \@stack); # don't add depth
 	    }
-	    elsif ( $opcode =~ /return/i || $opcode =~ /retlw/i || 
-		    $opcode =~ /retfie/i ) {
+	    elsif ( $opcode =~ /retlw/i ) {
+		if ( $in_lookup_table ) {
+		    # If we're in a lookup table, and we hit a 'retlw', then
+		    # we want to end this avenue as soon as we find a non-
+		    # goto/retlw.
+		    $lookup_table_did_goto = 1;
+		} else {
+		    # done with this avenue.
+		    return;
+		}
+	    }
+	    elsif ( $opcode =~ /return/i || $opcode =~ /retfie/i ) {
 		# And we're done with this avenue.
 		return;
+	    }
+
+	    if ( $word == 0x0782 ) { # Is it 'addwf PCL, F' ?
+		# It's probably a lookup table, then.
+		$in_lookup_table = 1;
 	    }
 
 	}
@@ -686,8 +749,10 @@ sub find_opcode {
 
     foreach my $opcode (keys(%instructions)) {
 	my $info = $instructions{$opcode};
-	if (($word & $info->[1]) == $info->[0]) {
-	    return $opcode;
+	if ($info && scalar @$info==3) {
+	    if (($word & $info->[1]) == $info->[0]) {
+		return $opcode;
+	    }
 	}
     }
 
@@ -700,12 +765,25 @@ sub get_type {
     return $instructions{$opcode}->[2];
 }
 
+# Some labels might be too long to fit into the disassembly. If so, put a 
+# label on a line by itself.
+sub disassemble_label {
+    my ($address, $word) = @_;
+    if ($labels{$address} && length($labels{$address}) >= 16) {
+	return $labels{$address} . ':';
+    }
+}
+
 sub disassemble_instruction {
     my ($address, $word) = @_;
 
-    return sprintf("%s%-16.16s %-8.8s 0x%.2X",
+    my $label_to_use = $labels{$address} || '';
+    $label_to_use = ''
+	if (length($label_to_use) >= 16);
+
+    return sprintf("%s%-16.16s %-8.8s 0x%.4X",
 		   format_address($address),
-		   $labels{$address},
+		   $label_to_use,
 		   $opt_l?'dw':'DW',
 		   $word)
 	if (is_dwaddr($address));
@@ -714,7 +792,7 @@ sub disassemble_instruction {
     my $type = get_type($opcode);
     my $base = sprintf("%s%-16.16s %-8.8s", 
 		       format_address($address), 
-		       $labels{$address} || '',
+                       $label_to_use,
 		       $opcode,
                        );
 
@@ -825,6 +903,7 @@ sub usage {
 	"\t-r <filename>: load register name hint file <filename>\n".
 	"\t-s:            simplify labels as much as possible\n".
 	"\t-S <regexes>:  ignore labels in mapfile that match given (colon-separated) regexes\n".
+	"-t-I <sectionname>: do not disassemble given section name (requires -m)\n".
 	"\n"
 	;
     
@@ -947,13 +1026,30 @@ sub load_register_file {
 sub load_map_file {
     my ($file) = @_;
 
+    # Open the file and read in the section table.
+    open(FILE, $file) || die "Can't open map file '$file': $!";
+    while (<FILE>) {
+	chomp;
+	if (/^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+	    my ($sct, $type, $addr, $loc, $size) = ($1, $2, $3, $4, $5);
+	    if ($type =~ /code/ && $loc =~ /program/) {
+		my @range = ();
+		foreach my $i (0..(hex($size)/2)-1) {
+		    push (@range, $i + hex($addr));
+		}
+		$section{$sct} = \@range;
+	    }
+	}
+    }
+
+
     # Find anything that looks like an address, and create a dummy register 
     # hint file. Then load that.
 
     my $tmpfile = "/tmp/out.$$"; # FIXME this is a lousy temp file.
     open(OUT, ">", $tmpfile) || die "Can't open temp file '$tmpfile': $!";
 
-    open(FILE, $file) || die "Can't open map file '$file': $!";
+    seek(FILE, 0, SEEK_SET);
 readloop:
     while (<FILE>) {
 	chomp;
