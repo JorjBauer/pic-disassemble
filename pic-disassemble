@@ -20,7 +20,7 @@ use Data::Dumper;
 use Fcntl qw/:seek/;
 
 our ($opt_a, $opt_b, $opt_d, $opt_D, $opt_i, $opt_r, $opt_g, $opt_m, 
-     $opt_l, $opt_s, $opt_S, $opt_I);
+     $opt_l, $opt_s, $opt_S, $opt_I, $opt_o, $opt_O);
 
 our @depths;     # depth of all memory locations we've tested so far
 our @avenues;    # Avenues contain CP, pc, depth
@@ -33,7 +33,7 @@ my %graphopts = ( fontname => 'Times-Roman',
 		  labelfontsize => 10,
 		  );
 
-my $version = '1.11b';
+my $version = '1.12';
 
 # List of microcontroller instructions. The arrays are information about 
 # how to disassemble the instruction:
@@ -241,7 +241,7 @@ my $RP = 0;
 # We also try to keep track of the state of PCLATH<4:3>, code-page state.
 my $CP = 0;
 
-getopts('b:dD:i:m:r:alg:sS:I:');
+getopts('b:dD:i:m:r:alg:sS:I:oO');
 
 usage() if (! ($opt_b || $opt_i));
 
@@ -284,6 +284,7 @@ if ($opt_g) {
 # Note that we have to keep track of $RP and $CP to do this properly.
 my $address = 0;
 my $last_label;
+my %edge_exists;
 do {
     my $word = $memory[$address] || 0;
 
@@ -346,13 +347,17 @@ do {
 				 style => 'solid',
 				 color => 'black',
 				 );
-	    } else {
-		$graph->add_edge($from => $label,
-				 dir => 'both',
-				 style => 'dashed',
-				 color => 'red',
-				 %graphopts,
-				 );
+	    } elsif (!$opt_O) {
+		if ( ($opt_o && !$edge_exists{$from . '-' . $label}) ||
+		     !$opt_o ) {
+		    $graph->add_edge($from => $label,
+				     dir => 'both',
+				     style => 'dashed',
+				     color => 'red',
+				     %graphopts,
+			             );
+		    $edge_exists{$from . '-' . $label} = 1;
+		}
 	    }
 
 	} else {
@@ -900,6 +905,8 @@ sub usage {
 	"\t-g <filename>: graph, and save the gif as <filename>\n".
 	"\t-l:            show opcodes in lowercase\n".
 	"\t-m <filename>: load register hints from mapfile <filename>\n".
+	"\t-o:            draw only one trace for subroutine calls\n".
+	"-t-O:            draw no subroutine calls (overrides -o)\n".
 	"\t-r <filename>: load register name hint file <filename>\n".
 	"\t-s:            simplify labels as much as possible\n".
 	"\t-S <regexes>:  ignore labels in mapfile that match given (colon-separated) regexes\n".
