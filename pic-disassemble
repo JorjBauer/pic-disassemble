@@ -4,7 +4,7 @@
 #
 # PIC 16C84, 16F84, 16F627, 16F628 (and related) disassembler
 #
-#     (c) 2004-2009 Jorj Bauer, <jorj@jorj.org>
+#     (c) 2004-2010 Jorj Bauer, <jorj@jorj.org>
 #
 # Placed in the public domain. Free for any (including commercial) use.
 #
@@ -25,6 +25,7 @@ our ($opt_a, $opt_b, $opt_d, $opt_D, $opt_i, $opt_r, $opt_g, $opt_m,
 our @depths;     # depth of all memory locations we've tested so far
 our @avenues;    # Avenues contain CP, pc, depth
 our @stacks;     # Stack traces for deepest calls to functions
+our %nodes;
 
 # Default options for all graph nodes.
 my %graphopts = ( fontname => 'Times-Roman',
@@ -33,7 +34,7 @@ my %graphopts = ( fontname => 'Times-Roman',
 		  labelfontsize => 10,
 		  );
 
-my $version = '1.12';
+my $version = '1.13';
 
 # List of microcontroller instructions. The arrays are information about 
 # how to disassemble the instruction:
@@ -284,7 +285,6 @@ if ($opt_g) {
 # chunk of memory. If it does, we'll create a label for that chunk of memory.
 # Note that we have to keep track of $RP and $CP to do this properly.
 my $address = 0;
-my $last_label;
 my %edge_exists;
 do {
     my $word = $memory[$address] || 0;
@@ -306,101 +306,15 @@ do {
         my $target = ($word & 0x7FF) + ($CP << 11);
 	my $label = make_label($target);
 
-	if ($label !~ /^L[0-9A-Fx]+/) {
-	    $last_label = $label;
-	} else {
-	    if ($opt_g) {
-		# Anonymous labels have an implicit edge from the last 
-		# non-anonymous label.
-		$graph->add_edge($last_label => $label,
-				 dir => 'forward',
-				 style => 'dotted',
-				 color => 'black',
-				 %graphopts,
-				 );
-	    }
-	}
-	if ($opt_g) {
-	    # graphing, so add it
-	    if (!$labels{$target}) {
-		$labels{$target} = $label;
-		$graph->add_node($label,
-				 %graphopts,
-				 );
-	    }
-	    if (!$labels{$address} && !$opt_s) {
-		# (don't add anon labels if we're in simple label mode.)
-		$labels{$address} = make_label($address);
-		$graph->add_node($labels{$address},
-				 %graphopts,
-				 );
-	    }
-
-	    # Add a line for the call to the subroutine or goto statement.
-	    my $from = $labels{$address};
-	    $from = minimal_labels(\%labels, $address)
-		if ($opt_s);
-
-	    if (is_goto($address)) {
-		$graph->add_edge($from => $label,
-				 %graphopts,
-				 dir => 'forward',
-				 style => 'solid',
-				 color => 'black',
-				 );
-	    } elsif (!$opt_O) {
-		if ( ($opt_o && !$edge_exists{$from . '-' . $label}) ||
-		     !$opt_o ) {
-		    $graph->add_edge($from => $label,
-				     dir => 'both',
-				     style => 'dashed',
-				     color => 'red',
-				     %graphopts,
-			             );
-		    $edge_exists{$from . '-' . $label} = 1;
-		}
-	    }
-
-	} else {
-	    # not graphing, so it's simple...
-	    $labels{$target} = $label unless ($labels{$target});
-	}
+	$labels{$target} = $label unless ($labels{$target});
     }
 
     $address++;
 } while ($address < $codesize);
 
-# Add graph edges for all of the postponed fallthrough labels.
-if ($opt_g) {
-    # we only want to "fall through" (create continuance labels) if the 
-    # previous instruction wasn't an unconditional branch (i.e. if there's
-    # no interruption in the program flow).
-
-    foreach my $i (sort {$b <=> $a} keys(%labels)) {
-	next if ($i >= $MAX_PROGRAM_SPACE || $i <= 5);
-
-	# Skip anon labels if simple labels are enabled
-	next if ($opt_s && $labels{$i} =~ /^L[0-9A-Fx]+/);
-
-	my $from;
-	if ($opt_s) {
-	    $from = minimal_labels(\%labels, $i);
-	    next if $from eq $labels{$i};
-	} else {
-	    $from = find_previous_label(\%labels, $i);
-	}
-
-	$graph->add_edge($from => $labels{$i},
-			 dir => 'forward',
-			 style => 'dotted',
-			 color => 'magenta',
-			 %graphopts)
-	    unless (unconditional_branch_before($i));
-    }
-
-}
-
-perform_call_depth_analysis() if ($opt_d);
+# If we're graphing, or if we're performing call depth analysis, we have to
+# follow the code flow through the program.
+perform_call_depth_analysis() if ($opt_d || $opt_g);
 
 # Second pass: go back through and print the disassembly.
 $RP = 0;
@@ -552,6 +466,7 @@ sub add_avenue {
     my $a = { pc => $where,
 	      depth => $depth,
 	      stack => $stack };
+
     push (@avenues, $a);
 }
 
@@ -564,6 +479,18 @@ sub clone_stack {
     }
 
     return @ret;
+}
+
+sub add_node {
+    my ($node) = @_;
+
+    return
+	if ($nodes{$node});
+
+    $graph->add_node($node,
+		     %graphopts,
+	);
+    $nodes{$node} = 1;
 }
 
 sub examine_avenue {
@@ -590,7 +517,7 @@ sub examine_avenue {
 	    my $pre_label = disassemble_label($address, $word);
 	    my $disassembly = disassemble_instruction($pc, $word);
 	    my $opcode = find_opcode($word);
-
+	    
 	    # If we're currently in what looks like a lookup table, and 
 	    # we saw a 'goto' or 'retlw' before, and this opcode isn't
 	    #  a 'nop' or a 'goto' or a 'retlw', then we're done this avenue.
@@ -639,6 +566,22 @@ sub examine_avenue {
 		}
 
 		add_avenue($target, $depth + 1, [@stack, make_label($target)]);
+		if ($opt_g && !$opt_O) {
+		    my $from = make_label($avenue->{pc}); # starting point of avenue
+		    my $to = make_label($target);
+		    if ( ($opt_o && !$edge_exists{$from . '-' . $to}) ||
+			 !$opt_o ) {
+			add_node($from);
+			add_node($to);
+			$graph->add_edge($from => $to,
+					 dir => 'both',
+					 style => 'dashed',
+					 color => 'red',
+					 %graphopts,
+			    );
+			$edge_exists{$from . '-' . $to} = 1;
+		    }
+		}
 	    } elsif ( $opcode =~ /goto/i ) {
 		my $target = ($word & 0x7FF) + ($CP << 11);
 
@@ -649,6 +592,19 @@ sub examine_avenue {
 		}
 
 		add_avenue($target, $depth, \@stack);
+		if ($opt_g) {
+		    my $from = make_label($avenue->{pc}); # from starting PC of avenue
+		    my $to = make_label($target);
+		    add_node($from);
+		    add_node($to);
+		    $graph->add_edge($from => $to,
+				     %graphopts,
+				     dir => 'forward',
+				     style => 'solid',
+				     color => 'black',
+			);
+		}
+		
 		if ( $in_lookup_table ) {
 		    # If we're in a lookup table, and we hit a 'goto', then
 		    # we want to end this avenue as soon as we find a non-
@@ -662,6 +618,19 @@ sub examine_avenue {
 	    elsif ( $opcode =~ /btfs/i || $opcode =~ /incfsz/i || $opcode =~ /decfsz/i ) {
 		my $target = $pc + 2; # already takes $CP into account
 		add_avenue($target, $depth, \@stack); # don't add depth
+
+		if ($opt_g) {
+		    my $from = make_label($avenue->{pc}); # from starting PC of avenue
+		    my $to = make_label($target);
+		    add_node($from);
+		    add_node($to);
+		    $graph->add_edge($from => $to,
+				     %graphopts,
+				     dir => 'forward',
+				     style => 'dotted',
+				     color => 'black',
+			);
+		}
 	    }
 	    elsif ( $opcode =~ /retlw/i ) {
 		if ( $in_lookup_table ) {
@@ -909,15 +878,15 @@ sub usage {
 	"\t-D <number>:   With -d, will include stack dumps when >= the given number\n".
 	"\t-i <filename>: read from Intel Hex file <filename>\n".
 	"\t-g <filename>: graph, and save the gif as <filename>\n".
+	"\t-I <sectionname>: do not disassemble given section name (requires -m)\n".
 	"\t-l:            show opcodes in lowercase\n".
 	"\t-m <filename>: load register hints from mapfile <filename>\n".
 	"\t-o:            draw only one trace for subroutine calls\n".
-	"-t-O:            draw no subroutine calls (overrides -o)\n".
+	"\t-O:            draw no subroutine calls (overrides -o)\n".
 	"\t-r <filename>: load register name hint file <filename>\n".
 	"\t-s:            simplify labels as much as possible\n".
 	"\t-S <regexes>:  ignore labels in mapfile that match given (colon-separated) regexes\n".
-	"-t-I <sectionname>: do not disassemble given section name (requires -m)\n".
-	"-u:              show number of code words used\n".
+	"\t-u:            show number of code words used\n".
 	"\n"
 	;
     
