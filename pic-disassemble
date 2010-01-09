@@ -34,7 +34,7 @@ my %graphopts = ( fontname => 'Times-Roman',
 		  labelfontsize => 10,
 		  );
 
-my $version = '1.13';
+my $version = '1.14';
 
 # List of microcontroller instructions. The arrays are information about 
 # how to disassemble the instruction:
