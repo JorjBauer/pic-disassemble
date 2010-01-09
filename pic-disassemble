@@ -414,8 +414,8 @@ sub perform_call_depth_analysis {
     $CP = 0; # code page bits
 
     # Start with two avenues: one @ 0, and one @ 4
-    add_avenue(0, 0, []); # mem location 0, starting with depth=0
-    add_avenue(4, 1, ['INTERRUPT']); # Interrupts, by definition, must be 1 deep
+    add_avenue(0, 0, [], 'RESETVEC'); # mem location 0, starting with depth=0
+    add_avenue(4, 1, ['INTERRUPT'], 'INTRVEC'); # Interrupts, by definition, must be 1 deep
 
     # Loop as long as we have avenues to examine.
     while (scalar @avenues) {
@@ -434,7 +434,7 @@ sub perform_call_depth_analysis {
 }
 
 sub add_avenue {
-    my ($where, $depth, $stack) = @_;
+    my ($where, $depth, $stack, $avenue_head) = @_;
 
     my $CP = codepage($where);
 
@@ -465,7 +465,9 @@ sub add_avenue {
 
     my $a = { pc => $where,
 	      depth => $depth,
-	      stack => $stack };
+	      stack => $stack,
+	      avenue_head => $avenue_head
+    };
 
     push (@avenues, $a);
 }
@@ -565,9 +567,12 @@ sub examine_avenue {
 		    print STDERR "possible PCLATH error: address 0x$from calls 0x$to\n";
 		}
 
-		add_avenue($target, $depth + 1, [@stack, make_label($target)]);
+		add_avenue($target, 
+			   $depth + 1, 
+			   [@stack, make_label($target)], 
+			   make_label($target));
 		if ($opt_g && !$opt_O) {
-		    my $from = make_label($avenue->{pc}); # starting point of avenue
+		    my $from = $avenue->{avenue_head};
 		    my $to = make_label($target);
 		    if ( ($opt_o && !$edge_exists{$from . '-' . $to}) ||
 			 !$opt_o ) {
@@ -591,18 +596,22 @@ sub examine_avenue {
 		    print STDERR "possible PCLATH error: address 0x$from goes to 0x$to\n";
 		}
 
-		add_avenue($target, $depth, \@stack);
+		add_avenue($target, $depth, \@stack, make_label($target));
 		if ($opt_g) {
-		    my $from = make_label($avenue->{pc}); # from starting PC of avenue
+		    my $from = $avenue->{avenue_head};
 		    my $to = make_label($target);
-		    add_node($from);
-		    add_node($to);
-		    $graph->add_edge($from => $to,
-				     %graphopts,
-				     dir => 'forward',
-				     style => 'solid',
-				     color => 'black',
-			);
+		    if ( ($opt_o && !$edge_exists{$from . '-' . $to}) ||
+			 !$opt_o ) {
+			add_node($from);
+			add_node($to);
+			$graph->add_edge($from => $to,
+					 %graphopts,
+					 dir => 'forward',
+					 style => 'solid',
+					 color => 'black',
+			    );
+			$edge_exists{$from . '-' . $to} = 1;
+		    }
 		}
 		
 		if ( $in_lookup_table ) {
@@ -617,20 +626,7 @@ sub examine_avenue {
 	    }
 	    elsif ( $opcode =~ /btfs/i || $opcode =~ /incfsz/i || $opcode =~ /decfsz/i ) {
 		my $target = $pc + 2; # already takes $CP into account
-		add_avenue($target, $depth, \@stack); # don't add depth
-
-		if ($opt_g) {
-		    my $from = make_label($avenue->{pc}); # from starting PC of avenue
-		    my $to = make_label($target);
-		    add_node($from);
-		    add_node($to);
-		    $graph->add_edge($from => $to,
-				     %graphopts,
-				     dir => 'forward',
-				     style => 'dotted',
-				     color => 'black',
-			);
-		}
+		add_avenue($target, $depth, \@stack, $avenue->{avenue_head}); # don't add depth
 	    }
 	    elsif ( $opcode =~ /retlw/i ) {
 		if ( $in_lookup_table ) {
